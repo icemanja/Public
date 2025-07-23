@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Visor de Fotos Interactivo - nombre Empresa</title>
+    <style>
+        /* Estilos generales y para una apariencia moderna */
+        :root {
+            --primary-color: #333;
+            --secondary-color: #f4f4f4;
+            --highlight-color: #007bff;
+            --background-color: #222;
+            --text-color: #fff;
+            --shadow-color: rgba(0, 0, 0, 0.7);
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        /* Contenedor para la selección inicial de la carpeta */
+        #folder-picker-container {
+            text-align: center;
+            padding: 40px;
+            background-color: var(--primary-color);
+            border-radius: 15px;
+            box-shadow: 0 10px 30px var(--shadow-color);
+        }
+
+        #folder-picker-container h1 {
+            margin-top: 0;
+            font-size: 2.5em;
+            letter-spacing: 3px;
+            text-transform: uppercase;
+        }
+
+        #pick-folder-btn {
+            background-color: var(--highlight-color);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            font-size: 18px;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background-color 0.3s, transform 0.2s;
+        }
+        
+        #pick-folder-btn:hover {
+            background-color: #0056b3;
+            transform: scale(1.05);
+        }
+
+        /* Contenedor principal del carrusel (inicialmente oculto) */
+        #carousel-container {
+            position: relative;
+            width: 95vw;
+            max-width: 1200px;
+            height: 90vh;
+            max-height: 800px;
+            background-color: var(--primary-color);
+            border-radius: 15px;
+            box-shadow: 0 10px 30px var(--shadow-color);
+            display: none; /* Cambiado a none, se mostrará con JS */
+            flex-direction: column;
+            justify-content: space-between;
+            overflow: hidden;
+            transition: all 0.3s ease-in-out;
+        }
+        
+        /* Barra de cabecera con el nombre comercial */
+        #header-bar {
+            padding: 12px 20px;
+            text-align: center;
+            font-size: 1.4em;
+            font-weight: 600;
+            color: var(--text-color);
+            background-color: rgba(0,0,0,0.3);
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            flex-shrink: 0; /* Evita que se encoja si el espacio es reducido */
+        }
+
+        /* Visor de la imagen */
+        #image-viewer {
+            flex-grow: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            overflow: hidden;
+            position: relative;
+        }
+
+        #carousel-image {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            border-radius: 5px;
+            transition: opacity 0.4s ease-in-out;
+            opacity: 1;
+        }
+
+        #carousel-image.fade {
+            opacity: 0;
+        }
+
+        /* Botones de navegación (anterior/siguiente) */
+        .nav-btn {
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            background-color: rgba(0, 0, 0, 0.4);
+            color: white;
+            border: none;
+            padding: 15px;
+            cursor: pointer;
+            border-radius: 50%;
+            font-size: 24px;
+            z-index: 10;
+            transition: background-color 0.2s;
+            width: 50px;
+            height: 50px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .nav-btn:hover {
+            background-color: rgba(0, 0, 0, 0.7);
+        }
+
+        #prev-btn { left: 15px; }
+        #next-btn { right: 15px; }
+        
+        /* Barra de información y controles inferiores */
+        #controls-bar {
+            background-color: rgba(0, 0, 0, 0.5);
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        #photo-info {
+            flex-grow: 1;
+            text-align: left;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-right: 20px;
+        }
+        
+        #control-buttons { display: flex; gap: 15px; }
+
+        .control-btn {
+            background: none; border: none; color: white;
+            font-size: 22px; cursor: pointer;
+            transition: color 0.2s, transform 0.2s;
+        }
+        .control-btn:hover { color: var(--highlight-color); transform: scale(1.1); }
+
+        /* Puntos de navegación */
+        #dots-container {
+            padding: 10px; background-color: rgba(0,0,0,0.2);
+            text-align: center; overflow-x: auto; white-space: nowrap;
+        }
+
+        .dot {
+            display: inline-block; width: 12px; height: 12px;
+            background-color: #777; border-radius: 50%;
+            margin: 0 5px; cursor: pointer; transition: background-color 0.3s;
+        }
+
+        .dot.active { background-color: var(--highlight-color); }
+        
+        /* Estilos para el modo de pantalla completa */
+        #carousel-container:fullscreen {
+            max-width: 100vw; max-height: 100vh;
+            width: 100vw; height: 100vh; border-radius: 0;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Contenedor inicial para seleccionar la carpeta -->
+    <div id="folder-picker-container">
+        <h1>nombre Empresa</h1>
+        <p>Selecciona la carpeta que contiene tus imágenes para empezar.</p>
+        <button id="pick-folder-btn">Seleccionar Carpeta de Fotos</button>
+        <!-- Input oculto para la selección de directorios -->
+        <input type="file" id="folder-input" webkitdirectory multiple style="display: none;">
+    </div>
+
+    <!-- El carrusel principal, inicialmente oculto -->
+    <div id="carousel-container">
+        <div id="header-bar">nombre Empresa</div>
+        <div id="image-viewer">
+            <img id="carousel-image" src="" alt="Visor de fotos">
+            <button id="prev-btn" class="nav-btn">&#10094;</button>
+            <button id="next-btn" class="nav-btn">&#10095;</button>
+        </div>
+        
+        <div id="controls-bar">
+            <div id="photo-info"></div>
+            <div id="control-buttons">
+                 <button id="autoplay-btn" class="control-btn" title="Iniciar/detener reproducción automática">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+                 </button>
+                 <button id="fullscreen-btn" class="control-btn" title="Pantalla completa">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"></path></svg>
+                 </button>
+            </div>
+        </div>
+
+        <div id="dots-container"></div>
+    </div>
+
+    <script>
+        // --- Selección de elementos del DOM ---
+        const folderPickerContainer = document.getElementById('folder-picker-container');
+        const pickFolderBtn = document.getElementById('pick-folder-btn');
+        const folderInput = document.getElementById('folder-input');
+        
+        const carouselContainer = document.getElementById('carousel-container');
+        const image = document.getElementById('carousel-image');
+        const prevBtn = document.getElementById('prev-btn');
+        const nextBtn = document.getElementById('next-btn');
+        const dotsContainer = document.getElementById('dots-container');
+        const photoInfo = document.getElementById('photo-info');
+        const autoplayBtn = document.getElementById('autoplay-btn');
+        const fullscreenBtn = document.getElementById('fullscreen-btn');
+        
+        // --- Variables de estado ---
+        let photoList = [];
+        let currentIndex = 0;
+        let autoplayInterval = null;
+
+        // --- Iconos SVG para los botones ---
+        const playIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>`;
+        const pauseIcon = `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>`;
+
+        // --- Lógica de la aplicación ---
+
+        // 1. Evento para el botón de selección de carpeta
+        pickFolderBtn.addEventListener('click', () => {
+            folderInput.click();
+        });
+
+        // 2. Evento cuando el usuario selecciona los archivos
+        folderInput.addEventListener('change', (event) => {
+            const files = event.target.files;
+            if (files.length === 0) return;
+
+            const imageExtensions = /\.(jpg|jpeg|png|gif|webp|bmp)$/i;
+            const imageFiles = Array.from(files).filter(file => imageExtensions.test(file.name));
+
+            if (imageFiles.length === 0) {
+                alert("No se encontraron imágenes en la carpeta seleccionada. Por favor, elige una carpeta que contenga archivos .jpg, .png, .gif, etc.");
+                return;
+            }
+
+            // Limpiamos la lista anterior y creamos URLs para las nuevas imágenes
+            photoList.forEach(photo => URL.revokeObjectURL(photo.url));
+            photoList = imageFiles.map(file => ({
+                url: URL.createObjectURL(file),
+                name: file.webkitRelativePath || file.name
+            }));
+            
+            // Ocultar el selector y mostrar el carrusel
+            folderPickerContainer.style.display = 'none';
+            carouselContainer.style.display = 'flex';
+            
+            // Iniciar el carrusel
+            initializeCarousel();
+        });
+
+        // 3. Inicializa y arranca el carrusel
+        function initializeCarousel() {
+            currentIndex = 0;
+            createDots();
+            showPhoto(0);
+            setupEventListeners();
+        }
+
+        function showPhoto(index) {
+            image.classList.add('fade');
+            
+            setTimeout(() => {
+                currentIndex = (index + photoList.length) % photoList.length;
+                const photo = photoList[currentIndex];
+                image.src = photo.url;
+                image.alt = photo.name;
+                
+                photoInfo.textContent = `${currentIndex + 1} / ${photoList.length} - ${photo.name}`;
+                updateDots();
+                
+                image.classList.remove('fade');
+            }, 400);
+        }
+
+        function nextPhoto() { showPhoto(currentIndex + 1); }
+        function prevPhoto() { showPhoto(currentIndex - 1); }
+
+        function updateDots() {
+            const dots = document.querySelectorAll('.dot');
+            dots.forEach((dot, index) => dot.classList.toggle('active', index === currentIndex));
+            const activeDot = dotsContainer.querySelector('.active');
+            if (activeDot) {
+                activeDot.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+            }
+        }
+
+        function createDots() {
+            dotsContainer.innerHTML = '';
+            photoList.forEach((_, index) => {
+                const dot = document.createElement('span');
+                dot.classList.add('dot');
+                dot.addEventListener('click', () => showPhoto(index));
+                dotsContainer.appendChild(dot);
+            });
+        }
+
+        function toggleAutoplay() {
+            if (autoplayInterval) {
+                clearInterval(autoplayInterval);
+                autoplayInterval = null;
+                autoplayBtn.innerHTML = playIcon;
+                autoplayBtn.title = "Iniciar reproducción automática";
+            } else {
+                autoplayInterval = setInterval(nextPhoto, 3000);
+                autoplayBtn.innerHTML = pauseIcon;
+                autoplayBtn.title = "Detener reproducción automática";
+            }
+        }
+
+        function toggleFullscreen() {
+            if (!document.fullscreenElement) {
+                carouselContainer.requestFullscreen().catch(err => {
+                    alert(`Error: ${err.message}`);
+                });
+            } else {
+                document.exitFullscreen();
+            }
+        }
+        
+        // Configura los listeners una sola vez
+        function setupEventListeners() {
+            prevBtn.onclick = prevPhoto;
+            nextBtn.onclick = nextPhoto;
+            autoplayBtn.onclick = toggleAutoplay;
+            fullscreenBtn.onclick = toggleFullscreen;
+            
+            // Usamos un manejador de eventos con nombre para poder quitarlo si es necesario
+            document.onkeydown = handleKeyDown;
+        }
+
+        function handleKeyDown(e) {
+            if (e.key === 'ArrowRight') nextPhoto();
+            if (e.key === 'ArrowLeft') prevPhoto();
+            if (e.key === ' ') {
+                e.preventDefault();
+                toggleAutoplay();
+            }
+        }
+    </script>
+</body>
+</html>
