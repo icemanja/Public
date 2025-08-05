@@ -1,0 +1,574 @@
+﻿Plan Maestro: Desarrollo y Despliegue Directo en Servidor Linux
+Objetivo del Proyecto: Instalar, desarrollar y desplegar la aplicación de verificación de NIF/IVA íntegramente en un servidor on-premise, sin usar un ordenador de desarrollo local.
+Sección 1: Preparación del Servidor
+Esta es la base. Asumimos que tienes acceso por terminal (SSH) a un servidor con Ubuntu Server 22.04 LTS.
+Paso 1.1: Conexión y Actualización del Sistema
+1. Conéctate al servidor:
+ssh tu_usuario@ip_del_servidor
+
+2. Actualiza todo el software para asegurar la estabilidad y seguridad:
+sudo apt update && sudo apt upgrade -y
+
+Paso 1.2: Instalar las Herramientas Necesarias
+Instalaremos todo lo que necesitamos para desarrollar y desplegar:
+sudo apt install -y python3-pip python3-venv unzip nginx nano
+
+   * nginx, python3-pip, python3-venv, unzip: Igual que antes.
+   * nano: Un editor de texto sencillo para la terminal que usaremos para escribir nuestro código.
+
+Sección 2: Creación del Proyecto Directamente en el Servidor
+Aquí es donde cambia el flujo: construiremos todo desde la línea de comandos.
+Paso 2.1: Crear la Estructura de Ficheros
+   1. Crea el directorio donde vivirá la aplicación y entra en él:
+sudo mkdir -p /var/www/verificador_app
+sudo chown -R $USER:$USER /var/www/verificador_app
+cd /var/www/verificador_app
+
+Paso 2.2: Subir y Preparar el Certificado Digital
+      1. Desde tu ordenador local, sube tu certificado (.p12 o .pfx) al servidor usando scp:
+scp /ruta/local/a/tu_certificado.p12 tu_usuario@ip_del_servidor:/var/www/verificador_app/
+
+      2. De vuelta en la terminal del servidor, convierte el certificado al formato .pem que necesita Python. Te pedirá la contraseña del certificado.
+openssl pkcs12 -in tu_certificado.p12 -nocerts -out clave_privada.pem -nodes
+openssl pkcs12 -in tu_certificado.p12 -nokeys -out certificado_publico.pem
+
+      3. Asegura los permisos de los ficheros de clave para que solo tú puedas leerlos:
+chmod 600 clave_privada.pem certificado_publico.pem
+
+Paso 2.3: Configurar el Entorno de Python
+         1. Crea el entorno virtual:
+python3 -m venv venv
+
+         2. Actívalo (tendrás que hacer esto cada vez que te conectes en una nueva sesión para trabajar en el proyecto):
+source venv/bin/activate
+
+         3. Instala las librerías necesarias:
+pip install flask zeep gunicorn requests
+
+Paso 2.4: Escribir el Código de la Aplicación con nano
+Fichero 1: aeat_verifier.py (Conexión con Hacienda)
+            1. Abre el editor nano para crear el fichero:
+nano aeat_verifier.py
+
+            2. Pega el siguiente código dentro de nano.
+# aeat_verifier.py
+"""Consulta al servicio VNifV2 de la AEAT para validar NIF/CIF con nombre.
+- Requiere certificado electrónico (.pem) en el servidor.
+- Si se activa debug=True, guarda petición y respuesta en un log.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import string
+import unicodedata
+from datetime import datetime
+from xml.etree import ElementTree
+
+import requests
+from requests.exceptions import SSLError, RequestException
+
+# ---------------------------------------------------------------------------
+# CONFIGURACIÓN (ajusta las rutas a tu entorno)
+# ---------------------------------------------------------------------------
+
+URL = "https://www1.agenciatributaria.gob.es/wlpl/BURT-JDIT/ws/VNifV2SOAP"
+
+BASE_DIR = "/var/www/verificador_app"
+CERT_FILE = os.path.join(BASE_DIR, "certificado_publico.pem")
+KEY_FILE = os.path.join(BASE_DIR, "clave_privada.pem")
+DEBUG_LOG_FILE = os.path.join(BASE_DIR, "aeat_debug.log")
+
+SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/"
+SAL_NS = (
+   "http://www2.agenciatributaria.gob.es/static_files/common/internet/dep/"
+   "aplicaciones/es/aeat/burt/jdit/ws/VNifV2Sal.xsd"
+)
+
+# ---------------------------------------------------------------------------
+# CLASE PRINCIPAL
+# ---------------------------------------------------------------------------
+
+class NifVerifier:
+   """Cliente mínimo para el servicio VNifV2."""
+
+   def __init__(self, nif_solicitante: str, nombre_solicitante: str, *, debug: bool = False):
+       self.debug = debug
+
+       if not (os.path.exists(CERT_FILE) and os.path.exists(KEY_FILE)):
+           raise FileNotFoundError(
+               "No se encontraron los ficheros del certificado. "
+               f"Revise rutas: {CERT_FILE}, {KEY_FILE}"
+           )
+
+       self.cert = (CERT_FILE, KEY_FILE)
+       print("✔️  Verificador AEAT inicializado")
+       if self.debug:
+           print(f"⚠️  DEBUG activado. Log: {DEBUG_LOG_FILE}")
+
+   # ------------------------------------------------------------------
+   # Helpers
+   # ------------------------------------------------------------------
+
+   @staticmethod
+   def _normaliza(cad: str) -> str:
+       cad = unicodedata.normalize("NFKD", cad).encode("ascii", "ignore").decode()
+       cad = cad.upper()
+       cad = cad.translate(str.maketrans("", "", string.punctuation))
+       cad = re.sub(r"\s+", " ", cad).strip()
+       cad = re.sub(r"\b(SL|S\.L\.?|SLU|S\.L\.U\.?)\b", "SL", cad)
+       return cad
+
+   def _write_debug_log(self, request_xml: str, response_bytes: bytes) -> None:
+       try:
+           with open(DEBUG_LOG_FILE, "ab") as fh:
+               ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode()
+               fh.write(b"\n--- NUEVA CONSULTA @ " + ts + b" ---\n")
+               fh.write(b"PETICION ENVIADA:\n")
+               fh.write(request_xml.encode("utf-8"))
+               fh.write(b"\n\nRESPUESTA RECIBIDA:\n")
+               fh.write(response_bytes)
+               fh.write(b"\n--- FIN CONSULTA ---\n")
+       except Exception as exc:
+           print(f"🔴 No pude escribir debug log: {exc}")
+
+   # ------------------------------------------------------------------
+   # Método principal
+   # ------------------------------------------------------------------
+
+   def verify_nif(self, nif_a_consultar: str, nombre_a_consultar: str) -> dict[str, str]:
+       # ------------------------- SOAP -------------------------------
+       soap_body = f"""<soapenv:Envelope xmlns:soapenv="{SOAP_NS}" xmlns:vnif="http://www2.agenciatributaria.gob.es/static_files/common/internet/dep/aplicaciones/es/aeat/burt/jdit/ws/VNifV2Ent.xsd">
+
+soapenv:Header/
+soapenv:Body
+vnif:VNifV2Ent
+vnif:Contribuyente
+vnif:Nif{nif_a_consultar}</https://www.google.com/search?q=vnif:Nif>
+vnif:Nombre{nombre_a_consultar}</https://www.google.com/search?q=vnif:Nombre>
+</https://www.google.com/search?q=vnif:Contribuyente>
+</https://www.google.com/search?q=vnif:VNifV2Ent>
+</https://www.google.com/search?q=soapenv:Body>
+</soapenv:Envelope>"""
+        headers = {"Content-Type": "text/xml; charset=utf-8"}
+
+       try:
+           response = requests.post(URL, data=soap_body.encode("utf-8"), headers=headers, cert=self.cert)
+
+           if self.debug:
+               self._write_debug_log(soap_body, response.content)
+
+           response.raise_for_status()
+
+           # --------------------- Parseo XML --------------------------
+           ns = {"soapenv": SOAP_NS, "sal": SAL_NS}
+           root = ElementTree.fromstring(response.content)
+
+           resultado_raw = root.findtext(".//sal:Resultado", default="DESCONOCIDO", namespaces=ns)
+           nombre_dev = root.findtext(".//sal:Nombre", default="", namespaces=ns)
+           nif_dev = root.findtext(".//sal:Nif", default="", namespaces=ns)
+
+           ok_status = {"IDENTIFICADO", "IDENTIFICADO-BAJA", "IDENTIFICADO-REVOCADO"}
+
+           nif_pedido = nif_a_consultar.upper().strip()
+           nif_dev_u = nif_dev.upper().strip()
+
+           nombre_pedido_norm = self._normaliza(nombre_a_consultar) if nombre_a_consultar else ""
+           nombre_dev_norm = self._normaliza(nombre_dev) if nombre_dev else ""
+
+           nombre_provisto = bool(nombre_pedido_norm)
+           coincide_nif = nif_pedido == nif_dev_u
+           coincide_nombre = (not nombre_provisto) or (nombre_pedido_norm == nombre_dev_norm)
+
+           # --------------------- Resultado ---------------------------
+           if resultado_raw in ok_status and coincide_nif and coincide_nombre:
+               resultado_final = "✅ Identificado"
+               datos_extra = "Los datos de NIF y Nombre coinciden."
+           elif resultado_raw in ok_status and coincide_nif and nombre_provisto and not coincide_nombre:
+               resultado_final = "⚠️ NIF identificado, pero el nombre NO coincide"
+               datos_extra = (
+                   f"Nombre devuelto por la AEAT: {nombre_dev}\n"
+                   f"NIF devuelto: {nif_dev}\n\n"
+                   "El NIF existe, pero la razón social indicada no coincide."
+               )
+           elif resultado_raw in ok_status and not coincide_nif:
+               resultado_final = "⚠️ La AEAT devuelve un NIF distinto"
+               datos_extra = (
+                   f"NIF devuelto por la AEAT: {nif_dev}\n"
+                   "Revisa si has escrito correctamente la letra de control."
+               )
+           else:
+               resultado_final = f"❌ {resultado_raw}"
+               datos_extra = (
+                   "El NIF/NIE no se ha podido identificar con esos datos. "
+                   "Verifica que el NIF y el nombre son correctos."
+               )
+
+           return {
+               "consulta": f"{nif_a_consultar} - {nombre_a_consultar}",
+               "resultado": resultado_final,
+               "datos": (
+                   f"Nombre devuelto: {nombre_dev}\n"
+                   f"NIF devuelto: {nif_dev}\n\n"
+                   f"{datos_extra}"
+               ),
+               "fuente": "Agencia Tributaria (España)",
+           }
+
+       except SSLError as exc:
+           return {
+               "consulta": nif_a_consultar,
+               "resultado": "Error de Certificado",
+               "datos": (
+                   "La conexión SSL/TLS falló. "
+                   "Comprueba el certificado instalado.\n"
+                   f"Detalle: {exc}"
+               ),
+               "fuente": "Agencia Tributaria (España)",
+           }
+       except RequestException as exc:
+           return {
+               "consulta": nif_a_consultar,
+               "resultado": "Error de Conexión",
+               "datos": (
+                   "No se pudo conectar con la AEAT. Verifica la conectividad.\n"
+                   f"Detalle: {exc}"
+               ),
+               "fuente": "Agencia Tributaria (España)",
+           }
+       except ElementTree.ParseError:
+           return {
+               "consulta": nif_a_consultar,
+               "resultado": "Error de Respuesta",
+               "datos": (
+                   "La AEAT devolvió una respuesta inválida (no es XML).\n\n"
+                   f"Respuesta bruta:\n{response.text}"
+               ),
+               "fuente": "Agencia Tributaria (España)",
+           }
+```
+
+               3. Para guardar y salir, pulsa Ctrl+X, luego Y y finalmente Enter.
+Fichero 2: vies_verifier.py (Conexión con Europa)
+               1. Abre nano para el segundo fichero:
+nano vies_verifier.py
+
+               2. Pega este código.
+# vies_verifier.py
+import zeep
+
+VIES_WSDL_URL = 'http://ec.europa.eu/taxation_customs/vies/checkVatService.wsdl'
+
+class ViesVerifier:
+   def __init__(self):
+       try:
+           self.client = zeep.Client(wsdl=VIES_WSDL_URL)
+           print("✔️  Verificador VIES (Europa) inicializado.")
+       except Exception as e:
+           self.client = None
+           print(f"Error al inicializar VIES: {e}")
+
+   def verify_vat(self, vat_number: str) -> dict:
+       if not self.client:
+           return {"resultado": "Error", "datos": "El servicio VIES no está disponible."}
+       try:
+           country_code = vat_number[:2].upper()
+           number = vat_number[2:]
+           response = self.client.service.checkVat(countryCode=country_code, vatNumber=number)
+
+           if response.valid:
+               if response.name and response.name != "---":
+                   datos_completos = f"{response.name}\nDirección: {response.address}"
+               else:
+                   datos_completos = "El estado miembro no proporcionó datos de nombre/dirección."
+
+               return {
+                   "consulta": vat_number,
+                   "resultado": "✅ Válido",
+                   "datos": datos_completos,
+                   "fuente": "Servicio VIES (Unión Europea)"
+               }
+           else:
+               return {
+                   "consulta": vat_number,
+                   "resultado": "❌ No Válido",
+                   "datos": "El número de IVA no es válido o el formato es incorrecto.",
+                   "fuente": "Servicio VIES (Unión Europea)"
+               }
+       except Exception as e:
+           return {
+               "consulta": vat_number,
+               "resultado": "Error de Conexión",
+               "datos": f"No se pudo consultar el servicio VIES. Causa: {e}",
+               "fuente": "Servicio VIES (Unión Europea)"
+           }
+
+               3. Guarda y sal (Ctrl+X, Y, Enter).
+Fichero 3: app.py (La Aplicación Principal)
+                  1. Abre nano para el fichero principal:
+nano app.py
+
+                  2. Pega el código de la aplicación.
+# app.py
+from flask import Flask, request, jsonify, render_template_string
+from aeat_verifier import NifVerifier
+from vies_verifier import ViesVerifier
+
+app = Flask(__name__)
+
+# --- CONFIGURACIÓN ---
+# Para activar el log de depuración, cambia DEBUG_AEAT a True
+DEBUG_AEAT = True
+
+# El nombre debe ser EXACTO al que figura en el censo de la AEAT
+NIF_TITULAR_CERTIFICADO = "XXXXXXX"
+NOMBRE_TITULAR_CERTIFICADO = "XXXXXXXXXXXXXXXX"
+
+# --- INICIALIZACIÓN DE SERVICIOS ---
+aeat_verifier = None
+try:
+   # Pasamos el flag de debug al inicializar el verificador
+   aeat_verifier = NifVerifier(NIF_TITULAR_CERTIFICADO, NOMBRE_TITULAR_CERTIFICADO, debug=DEBUG_AEAT)
+except Exception as e:
+   print(f"🔴 FALLO CRÍTICO al inicializar el verificador AEAT: {e}")
+vies_verifier = ViesVerifier()
+
+# --- PLANTILLA HTML DE LA INTERFAZ ---
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><title>Verificador NIF/IVA</title>
+<style>
+   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;max-width:700px;margin:40px auto;padding:20px;border:1px solid #ddd;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1)}
+   h1{color:#2c3e50;text-align:center}form{margin-top:25px}
+   .input-group{margin-bottom: 15px;}
+   .radio-group{display:flex;justify-content:center;margin-bottom:20px;gap:20px}
+   .radio-group label{padding:10px 20px;border:2px solid #ddd;border-radius:25px;cursor:pointer;transition:all .2s ease}
+   .radio-group input[type=radio]{display:none}
+   .radio-group input[type=radio]:checked+label{background-color:#007bff;color:white;border-color:#007bff}
+   input[type=text]{width:calc(100% - 22px);padding:12px;margin-top:5px;border:1px solid #ccc;border-radius:5px;font-size:16px}
+   button{width:100%;background-color:#28a745;color:white;padding:12px;border:none;border-radius:5px;margin-top:20px;cursor:pointer;font-size:18px;font-weight:bold}
+   button:hover{background-color:#218838}
+   #resultado{background-color:#f8f9fa;padding:20px;border:1px solid #eee;border-radius:5px;margin-top:20px;line-height:1.7;min-height:50px}
+   .result-line{margin-bottom:10px}
+   .result-line strong{color:#343a40}
+   .result-ok{color:#28a745;font-weight:bold}
+   .result-error{color:#dc3545;font-weight:bold}
+   .result-warn{color:#ffc107;font-weight:bold}
+   .result-info{color:#17a2b8;font-weight:bold}
+</style>
+</head><body>
+<div style="text-align: center; margin-bottom: 20px;">
+   <img src="/static/logo_empresa.jpg" alt="Logo de la Empresa" style="max-width: 200px; height: auto;">
+</div>
+<h1>Verificador Centralizado NIF / IVA</h1><form id="verifyForm">
+<div class="radio-group">
+   <input type="radio" id="tipo_nacional" name="tipo" value="nacional" checked><label for="tipo_nacional">🇪🇸 Nacional (NIF)</label>
+   <input type="radio" id="tipo_ue" name="tipo" value="ue"><label for="tipo_ue">🇪🇺 Extranjero (IVA UE)</label>
+</div>
+
+<div class="input-group">
+   <label for="numero"><b>Número a verificar:</b></label>
+   <input type="text" id="numero" name="numero" required placeholder="NIF, CIF o NIF-IVA...">
+</div>
+
+<div class="input-group" id="nombre-container">
+   <label for="nombre"><b>Nombre / Razón Social:</b></label>
+   <input type="text" id="nombre" name="nombre" placeholder="Nombre EXACTO (ej: LA EMPRESA, S.L.U.)">
+</div>
+
+<button type="submit">Verificar</button></form><h3>Resultado:</h3><div id="resultado">Esperando consulta...</div>
+<script>
+   const tipoNacionalRadio = document.getElementById('tipo_nacional');
+   const tipoUeRadio = document.getElementById('tipo_ue');
+   const nombreContainer = document.getElementById('nombre-container');
+   const nombreInput = document.getElementById('nombre');
+
+   function toggleNombreField() {
+       if (tipoNacionalRadio.checked) {
+           nombreContainer.style.display = 'block';
+           nombreInput.required = true;
+       } else {
+           nombreContainer.style.display = 'none';
+           nombreInput.required = false;
+       }
+   }
+
+   tipoNacionalRadio.addEventListener('change', toggleNombreField);
+   tipoUeRadio.addEventListener('change', toggleNombreField);
+
+   toggleNombreField();
+
+   document.getElementById('verifyForm').addEventListener('submit', async function(e){
+       e.preventDefault();
+       const tipo=document.querySelector('input[name="tipo"]:checked').value;
+       const numero=document.getElementById('numero').value;
+       const nombre=document.getElementById('nombre').value;
+       const resultadoEl=document.getElementById('resultado');
+
+       resultadoEl.innerHTML = 'Consultando, por favor espera...';
+
+       try {
+           let url = `/api/verificar?tipo=${tipo}&numero=${encodeURIComponent(numero)}`;
+           if (tipo === 'nacional') {
+               url += `&nombre=${encodeURIComponent(nombre)}`;
+           }
+
+           const response = await fetch(url);
+           const data = await response.json();
+
+           resultadoEl.innerHTML = '';
+
+           let resultadoHTML = '';
+           let resultadoClass = 'result-info';
+           if (data.resultado.includes('✅')) { resultadoClass = 'result-ok'; }
+           if (data.resultado.includes('❌')) { resultadoClass = 'result-error'; }
+           if (data.resultado.includes('⚠️')) { resultadoClass = 'result-warn'; }
+
+           resultadoHTML += `<div class="result-line"><strong>Consulta:</strong> ${data.consulta || ''}</div>`;
+           resultadoHTML += `<div class="result-line"><strong>Resultado:</strong> <span class="${resultadoClass}">${data.resultado || ''}</span></div>`;
+           resultadoHTML += `<div class="result-line"><strong>Datos:</strong><br><pre style="margin:5px 0 0 0; white-space:pre-wrap;">${data.datos || ''}</pre></div>`;
+           resultadoHTML += `<div class="result-line"><strong>Fuente:</strong> ${data.fuente || ''}</div>`;
+
+           resultadoEl.innerHTML = resultadoHTML;
+
+       } catch (error) {
+           resultadoEl.innerHTML = '<div class="result-error">Error de conexión con el servidor de la aplicación.</div>';
+       }
+   });
+</script>
+</body></html>
+"""
+
+@app.route('/')
+def index():
+   return render_template_string(HTML_TEMPLATE)
+
+@app.route('/api/verificar', methods=['GET'])
+def verificar_api():
+   tipo = request.args.get('tipo')
+   numero = request.args.get('numero')
+   nombre = request.args.get('nombre', '')
+
+   if not tipo or not numero:
+       return jsonify({"error": "Parámetros 'tipo' y 'numero' son requeridos."}), 400
+
+   if tipo == 'nacional':
+       if not nombre:
+           return jsonify({"error": "El parámetro 'nombre' es requerido para la consulta nacional."}), 400
+       if not aeat_verifier:
+           return jsonify({"error": "Servicio AEAT no disponible."}), 500
+       resultado = aeat_verifier.verify_nif(numero, nombre)
+   elif tipo == 'ue':
+       if not vies_verifier:
+           return jsonify({"error": "Servicio VIES no disponible."}), 500
+       resultado = vies_verifier.verify_vat(numero)
+   else:
+       return jsonify({"error": "Tipo no válido."}), 400
+
+   return jsonify(resultado)
+
+                  3. Guarda y sal (Ctrl+X, Y, Enter).
+Sección 3: Despliegue y Puesta en Marcha
+Con el código ya creado en el servidor, los pasos para el despliegue son los mismos que en la guía anterior.
+Paso 3.1: Configurar el Servicio Persistente (Systemd)
+                     1. Crea el fichero de servicio:
+sudo nano /etc/systemd/system/verificador.service
+
+                     2. Pega este contenido (cambiando tu_usuario por tu nombre de usuario):
+[Unit]
+Description=Gunicorn instance for Verificador NIF/IVA
+After=network.target
+
+[Service]
+User=tu_usuario
+Group=www-data
+WorkingDirectory=/var/www/verificador_app
+Environment="PATH=/var/www/verificador_app/venv/bin"
+ExecStart=/var/www/verificador_app/venv/bin/gunicorn --workers 3 --bind unix:verificador.sock -m 007 app:app
+
+[Install]
+WantedBy=multi-user.target
+
+                     3. Inicia y habilita el servicio:
+sudo systemctl start verificador
+sudo systemctl enable verificador
+sudo systemctl status verificador
+
+Paso 3.2: Configurar Nginx como Reverse Proxy
+                        1. Crea el fichero de configuración de Nginx:
+sudo nano /etc/nginx/sites-available/verificador
+
+                        2. Pega este contenido (cambiando ip_del_servidor por la IP real):
+server {
+   listen 80;
+   server_name ip_del_servidor;
+
+   # Ruta para servir ficheros estáticos (como el logo)
+   location /static {
+       alias /var/www/verificador_app/static;
+   }
+
+   # Ruta para la aplicación
+   location / {
+       include proxy_params;
+       proxy_pass http://unix:/var/www/verificador_app/verificador.sock;
+   }
+}
+
+                        3. Activa la configuración y reinicia Nginx:
+sudo ln -s /etc/nginx/sites-available/verificador /etc/nginx/sites-enabled
+sudo nginx -t
+sudo systemctl restart nginx
+
+¡Proyecto Terminado!
+La aplicación ya está completamente desarrollada y desplegada en el servidor. Cualquier usuario de tu red puede acceder a ella a través de http://ip_del_servidor.
+Sección 4: Gestión de Incidencias y Mantenimiento
+Esta sección te ayudará a resolver los problemas más comunes que pueden surgir.
+Modo de Depuración (Debug) para la AEAT
+Para ayudarte a diagnosticar problemas con la conexión a la AEAT, hemos añadido un modo de depuración.
+                           * Para activarlo:
+                           1. Edita el fichero app.py: nano /var/www/verificador_app/app.py.
+                           2. Busca la línea DEBUG_AEAT = False y cámbiala a DEBUG_AEAT = True.
+                           3. Guarda el fichero y reinicia el servicio: sudo systemctl restart verificador.
+                           * ¿Qué hace?
+                           * Cuando está activado, cada vez que hagas una consulta a la AEAT, la aplicación guardará la petición XML exacta que se envía y la respuesta XML completa que se recibe en un fichero llamado aeat_debug.log, ubicado en /var/www/verificador_app/.
+                           * ¿Cómo usarlo?
+                           * Para ver el contenido del fichero, usa el comando: cat /var/www/verificador_app/aeat_debug.log.
+                           * Para ver las nuevas respuestas en tiempo real, usa: tail -f /var/www/verificador_app/aeat_debug.log.
+                           * ¡Importante! Desactiva el modo de depuración (DEBUG_AEAT = False) cuando la aplicación funcione correctamente para evitar que el fichero de log crezca indefinidamente y ocupe espacio en el disco.
+Incidencia 1: Error 502 Bad Gateway en el navegador
+Este es el error más común. Significa que Nginx (el recepcionista) funciona, pero no puede comunicarse con tu aplicación Python (Gunicorn).
+                           * Diagnóstico Rápido:
+                           1. Comprueba el estado del servicio de la aplicación:
+sudo systemctl status verificador
+
+Si el estado no es active (running), la aplicación ha fallado.
+                           2. Si ha fallado, mira los logs para ver el error exacto de Python:
+sudo journalctl -u verificador -n 50 --no-pager
+
+Incidencia 2: La aplicación devuelve "Error de Conexión" con la AEAT
+Esto ocurre cuando la aplicación funciona, pero la comunicación específica con Hacienda falla.
+                              * Diagnóstico y Soluciones:
+                              1. Certificado Caducado o Incorrecto: Es la causa más probable. Activa el modo de depuración y revisa los logs del servicio (sudo journalctl -u verificador). Si ves un error de SSLError, el problema está en el certificado o en los datos del titular en app.py.
+                              2. Datos del Titular Incorrectos: Verifica que el NIF_TITULAR_CERTIFICADO y NOMBRE_TITULAR_CERTIFICADO en el fichero app.py son exactamente los que corresponden al certificado.
+                              3. El servidor no tiene salida a Internet: Comprueba la conectividad:
+ping www1.agenciatributaria.gob.es
+
+Si no responde, contacta con tu departamento de IT para revisar las reglas del firewall del servidor.
+Incidencia 3: El navegador muestra "No se puede acceder a este sitio web"
+Esto significa que ni siquiera Nginx está respondiendo.
+                                 * Diagnóstico y Soluciones:
+                                 1. Comprueba el estado de Nginx:
+sudo systemctl status nginx
+
+Si no está activo, inícialo: sudo systemctl start nginx.
+                                 2. Revisa la configuración de Nginx en busca de errores de sintaxis:
+sudo nginx -t
+
+Mantenimiento General
+                                    * Para actualizar el código:
+                                    1. Navega a /var/www/verificador_app.
+                                    2. Edita los ficheros .py con nano.
+                                    3. Reinicia el servicio para que los cambios surtan efecto: sudo systemctl restart verificador.
+                                    * Para mantener el servidor seguro: Ejecuta periódicamente sudo apt update && sudo apt upgrade -y.
